@@ -1,0 +1,134 @@
+#define BLYNK_TEMPLATE_ID "TMPL6gaZLUWhJ"
+#define BLYNK_TEMPLATE_NAME "FISMO Template"
+#define BLYNK_AUTH_TOKEN "TOKEN_BARU_KAMU"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+char ssid[] = "Wokwi-GUEST";
+char pass[] = "";
+
+#define MQ2_DOUT_PIN 32
+#define FLAME_PIN    35
+#define RELAY_PIN    22
+#define BUZZER_PIN   21
+
+const int GAS_AKTIF   = LOW;
+const int FLAME_AKTIF = HIGH;
+const int RELAY_ON    = HIGH;
+const int RELAY_OFF   = LOW;
+
+const unsigned long DELAY_GAS                = 3000;   // verifikasi gas
+const unsigned long DELAY_API                = 2000;   // verifikasi api
+const unsigned long DELAY_GAS_AMAN           = 2000;   // gas harus hilang 2 detik baru dianggap aman
+const unsigned long DURASI_PENDINGINAN_POMPA = 5000;   // pompa lanjut setelah api padam
+const unsigned long JEDA_NOTIF               = 15000;  // ulang notifikasi tiap 15 detik
+
+BlynkTimer timer;
+
+unsigned long gasMulai = 0, apiMulai = 0;      // kapan mulai terbaca (0 = tidak sedang terbaca)
+unsigned long gasHilang = 0, apiHilang = 0;    // kapan mulai tidak terbaca setelah bahaya
+unsigned long notifGasTerakhir = 0, notifApiTerakhir = 0;
+
+bool gasBahaya = false;   // true = bahaya sudah TERKONFIRMASI
+bool apiBahaya = false;
+bool statusBuzzer = false;
+
+void checkSensors() {
+  unsigned long now = millis();
+  bool gasTerbaca = (digitalRead(MQ2_DOUT_PIN) == GAS_AKTIF);
+  bool apiTerbaca = (digitalRead(FLAME_PIN) == FLAME_AKTIF);
+
+  // ===== 1. STATUS GAS =====
+  if (gasTerbaca) {
+    gasHilang = 0;
+    if (gasMulai == 0) gasMulai = now;
+    if (!gasBahaya && now - gasMulai >= DELAY_GAS) {
+      gasBahaya = true;
+      Serial.println("GAS: BAHAYA terkonfirmasi");
+    }
+  } else {
+    gasMulai = 0;
+    if (gasBahaya) {
+      if (gasHilang == 0) gasHilang = now;
+      else if (now - gasHilang >= DELAY_GAS_AMAN) {
+        gasBahaya = false;
+        gasHilang = 0;
+        notifGasTerakhir = 0;     // reset notifikasi HANYA saat bahaya benar-benar selesai
+        Serial.println("GAS: aman kembali");
+      }
+    }
+  }
+
+  // ===== 2. STATUS API + PENDINGINAN POMPA =====
+  if (apiTerbaca) {
+    apiHilang = 0;                // api masih ada / muncul lagi: batalkan hitungan pendinginan
+    if (apiMulai == 0) apiMulai = now;
+    if (!apiBahaya && now - apiMulai >= DELAY_API) {
+      apiBahaya = true;
+      Serial.println("API: BAHAYA terkonfirmasi, pompa ON");
+    }
+  } else {
+    apiMulai = 0;
+    if (apiBahaya) {
+      if (apiHilang == 0) {
+        apiHilang = now;
+        Serial.println("API: padam, pompa lanjut 5 detik (pendinginan)");
+      } else if (now - apiHilang >= DURASI_PENDINGINAN_POMPA) {
+        apiBahaya = false;
+        apiHilang = 0;
+        notifApiTerakhir = 0;     // reset notifikasi HANYA saat bahaya benar-benar selesai
+        Serial.println("API: aman kembali, pompa OFF");
+      }
+    }
+  }
+
+  // ===== 3. GERAKKAN KOMPONEN (offline-safe, tidak tergantung Blynk) =====
+  digitalWrite(RELAY_PIN, apiBahaya ? RELAY_ON : RELAY_OFF);
+
+  if (apiBahaya) {                        // api: bunyi putus-putus (prioritas)
+    statusBuzzer = !statusBuzzer;
+    digitalWrite(BUZZER_PIN, statusBuzzer ? HIGH : LOW);
+  } else if (gasBahaya) {                 // gas: bunyi terus
+    statusBuzzer = false;
+    digitalWrite(BUZZER_PIN, HIGH);
+  } else {                                // aman
+    statusBuzzer = false;
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+
+  // ===== 4. NOTIFIKASI (paling akhir, hanya jika Blynk tersambung) =====
+  if (Blynk.connected()) {
+    if (gasBahaya && (notifGasTerakhir == 0 || now - notifGasTerakhir >= JEDA_NOTIF)) {
+      Blynk.logEvent("gas_alert", "⚠️ Gas Detected!");
+      notifGasTerakhir = now;
+      Serial.printf("[%lu ms] notifikasi GAS dikirim\n", now);
+    }
+    if (apiBahaya && (notifApiTerakhir == 0 || now - notifApiTerakhir >= JEDA_NOTIF)) {
+      Blynk.logEvent("fire_alert", "🔥 Fire Detected!");
+      notifApiTerakhir = now;
+      Serial.printf("[%lu ms] notifikasi API dikirim\n", now);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println(GAS_AKTIF == LOW ? "Mode: HARDWARE" : "Mode: WOKWI");
+  digitalWrite(RELAY_PIN, RELAY_OFF);     // atur level "mati" dulu sebelum jadi OUTPUT
+  digitalWrite(BUZZER_PIN, LOW);
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(MQ2_DOUT_PIN, INPUT);
+  pinMode(FLAME_PIN, INPUT);
+
+  WiFi.begin(ssid, pass);
+  Blynk.config(BLYNK_AUTH_TOKEN);         // tidak menunggu koneksi
+
+  timer.setInterval(500L, checkSensors);
+}
+
+void loop() {
+  if (WiFi.status() == WL_CONNECTED) Blynk.run();
+  timer.run();
+}

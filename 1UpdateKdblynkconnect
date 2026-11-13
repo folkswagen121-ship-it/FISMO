@@ -1,0 +1,78 @@
+#define BLYNK_TEMPLATE_ID "TMPL6gaZLUWhJ"
+#define BLYNK_TEMPLATE_NAME "FISMO Template"
+#define BLYNK_AUTH_TOKEN "m_9Rgk3-n4qygxBNFROut9Te_nxetu_C"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+char ssid[] = "Wokwi-GUEST";      // Replace with your WiFi Name
+char pass[] = "";          // Replace with your WiFi Password
+
+#define MQ2_DOUT_PIN 32    // Digital Output pin for MQ2 DOUT
+#define FLAME_PIN 35       // Digital pin for Flame Sensor
+#define RELAY_PIN 22
+#define BUZZER_PIN 21
+
+BlynkTimer timer;
+
+void checkSensors() {
+  int flameValue = digitalRead(FLAME_PIN); // Read Flame Sensor
+  int gasValue = digitalRead(MQ2_DOUT_PIN); // Read Gas sensor DOUT (HIGH or LOW)
+
+  // Display gas value in Serial Monitor
+  Serial.print("Gas Value: ");
+  Serial.println(gasValue == HIGH ? "Gas Detected" : "No Gas Detected");
+
+  // GAS Detection: If gas detected (DOUT HIGH)
+  if (gasValue == HIGH) { 
+    if (Blynk.connected())
+    {
+    Blynk.logEvent("gas_alert", "⚠️ Gas Detected!");
+    }
+    digitalWrite(BUZZER_PIN, HIGH);
+  } else {
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+
+  // FIRE Detection: Flame sensor output is LOW when flame is detected
+  Serial.print("Flame Sensor: ");
+  Serial.println(flameValue == LOW ? "Flame Detected" : "No Flame");
+  if (flameValue == LOW) { // LOW = Flame Detected
+    if (Blynk.connected())
+    {
+    Blynk.logEvent("fire_alert", "🔥 Fire Detected!");
+    }
+    digitalWrite(RELAY_PIN, LOW);
+  } else {
+    digitalWrite(RELAY_PIN, HIGH);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(MQ2_DOUT_PIN, INPUT);  // Set the DOUT pin of MQ2 sensor as input
+  pinMode(FLAME_PIN, INPUT);     // Set the flame sensor pin as input
+
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  digitalWrite(RELAY_PIN, HIGH);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // Connect to Wifi
+  WiFi.begin(ssid, pass);
+  // Connect to blynk without stoping program code
+  Blynk.config(BLYNK_AUTH_TOKEN);
+
+  // Set the interval for checking sensors (every 2 seconds)
+  timer.setInterval(2000L, checkSensors);
+}
+// loop terkondisi, ketika wifi terhubung maka melanjutkan menghubungkan ke Blynk
+void loop() {
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        Blynk.run();
+    }
+  timer.run();    // Run the timer to check sensors periodically
+}

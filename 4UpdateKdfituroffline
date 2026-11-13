@@ -1,0 +1,111 @@
+#define BLYNK_TEMPLATE_ID "TMPL6gaZLUWhJ"
+#define BLYNK_TEMPLATE_NAME "FISMO Template"
+#define BLYNK_AUTH_TOKEN "m_9Rgk3-n4qygxBNFROut9Te_nxetu_C"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+char ssid[] = "Wokwi-GUEST";      // Replace with your WiFi Name
+char pass[] = "";          // Replace with your WiFi Password
+
+#define MQ2_DOUT_PIN 32    // Digital Output pin for MQ2 DOUT
+#define FLAME_PIN 35       // Digital pin for Flame Sensor
+#define RELAY_PIN 22
+#define BUZZER_PIN 21
+
+BlynkTimer timer;
+
+//Durasi verifikasi sebelum dianggap bahaya
+const unsigned long DELAY_GAS = 3000;
+const unsigned long DELAY_API = 2000;
+
+unsigned long waktuMulaiGas = 0;
+unsigned long waktuMulaiApi = 0;
+
+unsigned long terakhirKirimGas = 0;
+unsigned long terakhirKirimApi = 0;
+const unsigned long JEDA_NOTIF = 15000;// kirim ulang tiap 15 detik jika masih bahaya
+
+void checkSensors() {
+  int flameValue = digitalRead(FLAME_PIN); // Read Flame Sensor
+  int gasValue = digitalRead(MQ2_DOUT_PIN); // Read Gas sensor DOUT (HIGH or LOW)
+  unsigned long waktuSekarang = millis();
+
+  // Display gas value in Serial Monitor
+  Serial.print("Gas Value: ");
+  Serial.println(gasValue == HIGH ? "Gas Detected" : "No Gas Detected");
+
+  // --- DETEKSI GAS ---
+  if (gasValue == HIGH) {
+    if (waktuMulaiGas == 0) {
+      waktuMulaiGas = waktuSekarang; // 1. Catat waktu awal terdeteksi
+    } else if (waktuSekarang - waktuMulaiGas >= DELAY_GAS) {
+      // 2. PRIORITAS UTAMA (OFFLINE-SAFE): Buzzer langsung bunyi!
+      digitalWrite(BUZZER_PIN, HIGH);
+
+      // 3. PRIORITAS TAMBAHAN (ONLINE): Kirim notif tiap 15 detik jika terkoneksi
+      if (Blynk.connected() && (terakhirKirimGas == 0 || waktuSekarang - terakhirKirimGas >= JEDA_NOTIF)) {
+        Blynk.logEvent("gas_alert", "⚠️ Gas Detected!");
+        terakhirKirimGas = waktuSekarang;
+      }
+    }
+  } else {
+    // 4. KONDISI AMAN / FALSE ALARM: Reset semua
+    waktuMulaiGas = 0;
+    terakhirKirimGas = 0;
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+
+  // FIRE Detection: Flame sensor output is LOW when flame is detected
+  Serial.print("Flame Sensor: ");
+  Serial.println(flameValue == LOW ? "Flame Detected" : "No Flame");
+  // --- DETEKSI API ---
+  if (flameValue == LOW) {
+    if (waktuMulaiApi == 0) {
+      waktuMulaiApi = waktuSekarang; // 1. Catat waktu awal api terdeteksi
+    } else if (waktuSekarang - waktuMulaiApi >= DELAY_API) {
+      // 2. PRIORITAS UTAMA (OFFLINE-SAFE): Pompa langsung menyiram!
+      digitalWrite(RELAY_PIN, LOW);
+
+      // 3. PRIORITAS TAMBAHAN (ONLINE): Kirim notif tiap 15 detik jika terkoneksi
+      if (Blynk.connected() && (terakhirKirimApi == 0 || waktuSekarang - terakhirKirimApi >= JEDA_NOTIF)) {
+        Blynk.logEvent("fire_alert", "🔥 Fire Detected!");
+        terakhirKirimApi = waktuSekarang;
+      }
+    }
+  } else {
+    // 4. KONDISI AMAN / FALSE ALARM: Reset waktu, notif, dan matikan pompa
+    waktuMulaiApi = 0;
+    terakhirKirimApi = 0;
+    digitalWrite(RELAY_PIN, HIGH);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(MQ2_DOUT_PIN, INPUT);  // Set the DOUT pin of MQ2 sensor as input
+  pinMode(FLAME_PIN, INPUT);     // Set the flame sensor pin as input
+
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  digitalWrite(RELAY_PIN, HIGH);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // Connect to Wifi
+  WiFi.begin(ssid, pass);
+  // Connect to blynk without stoping program code
+  Blynk.config(BLYNK_AUTH_TOKEN);
+
+  // Set the interval for checking sensors (every 2 seconds)
+  timer.setInterval(500L, checkSensors);
+}
+// loop terkondisi, ketika wifi terhubung maka melanjutkan menghubungkan ke Blynk
+void loop() {
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        Blynk.run();
+    }
+  timer.run();    // Run the timer to check sensors periodically
+}
