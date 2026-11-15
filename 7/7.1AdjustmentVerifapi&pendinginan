@@ -1,0 +1,206 @@
+#define BLYNK_TEMPLATE_ID   "BLYNK_TEMPLATE_ID"
+#define BLYNK_TEMPLATE_NAME "BLYNK_TEMPLATE_NAME"
+#define BLYNK_AUTH_TOKEN    "BLYNK_AUTH_TOKEN"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+char ssid[] = "Name wiFi or Hostpot";
+char pass[] = "password";
+
+// ===== PIN (semua sudah terbukti) =====
+#define MQ2_AO_PIN 34   // AO MQ lewat pembagi tegangan 10k/20k
+#define FLAME_PIN  35   // DO sensor api
+#define BUZZER_PIN 21   // buzzer active-HIGH
+#define RELAY_PIN  22   // relay: ON = OUTPUT LOW, OFF = pin dilepas (INPUT)
+
+const int FLAME_AKTIF = HIGH;
+const int BUZZ_ON  = HIGH;
+const int BUZZ_OFF = LOW;
+
+// ===== AMBANG GAS (dari data tes: idle ~1935, puncak ~3173) =====
+const int GAS_ON_DELTA  = 500;
+const int GAS_OFF_DELTA = 250;
+
+// ===== WAKTU (ms) =====
+const unsigned long WARMUP_MS                = 20000; // pemanasan MQ (hanya menahan gas)
+const unsigned long CALIB_MS                 = 5000;  // ambil baseline
+const unsigned long DELAY_API                = 3000;  // api harus bertahan sekian ms
+const unsigned long DELAY_GAS                = 3000;  // gas harus bertahan sekian ms
+const unsigned long DELAY_GAS_AMAN           = 2000;  // gas harus hilang sekian ms baru aman
+const unsigned long DURASI_PENDINGINAN_POMPA = 5000;  // pompa lanjut setelah api padam
+const unsigned long DURASI_BIP_API           = 3000;  // bip api
+const unsigned long JEDA_NOTIF               = 15000; // ulang notifikasi
+const unsigned long CEK_WIFI_MS              = 10000;
+const unsigned long CEK_BLYNK_MS             = 20000;
+const unsigned long API_ABSEN_MIN = 500;  // api harus hilang sekian ms baru dianggap padam
+unsigned long apiAbsenSejak = 0;
+
+// ===== STATUS =====
+int baseline = 0;
+bool siap = false;              // true setelah warm-up + kalibrasi selesai
+long calSum = 0; int calN = 0;
+
+bool gasMentah = false, gasBahaya = false;
+bool apiBahaya = false, apiBahayaSebelumnya = false;
+
+unsigned long gasMulai = 0, gasHilang = 0;
+unsigned long apiMulai = 0, apiHilang = 0;
+unsigned long waktuBipApiMulai = 0;
+unsigned long notifGasTerakhir = 0, notifApiTerakhir = 0;
+unsigned long terakhirCetak = 0, terakhirCekWiFi = 0, terakhirCekBlynk = 0;
+
+void relayOn()  { pinMode(RELAY_PIN, OUTPUT); digitalWrite(RELAY_PIN, LOW); }
+void relayOff() { pinMode(RELAY_PIN, INPUT); }   // dilepas, bukan HIGH 3,3 V
+
+int bacaGas() {                                   // rata-rata 8 sampel
+  long s = 0;
+  for (int i = 0; i < 8; i++) s += analogRead(MQ2_AO_PIN);
+  return s / 8;
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  relayOff();
+  digitalWrite(BUZZER_PIN, BUZZ_OFF);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(FLAME_PIN, INPUT);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(MQ2_AO_PIN, ADC_11db);
+
+  // Tidak menunggu koneksi (offline-first)
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pass);
+  Blynk.config(BLYNK_AUTH_TOKEN);
+
+  Serial.println("FISMO mulai. Sensor api aktif sekarang. Gas: pemanasan 20 dtk + kalibrasi 5 dtk (JANGAN beri gas).");
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // ===== 0. JARINGAN (tidak boleh memblokir sensor) =====
+  if (WiFi.status() == WL_CONNECTED) {
+    if (Blynk.connected()) {
+      Blynk.run();
+    } else if (now - terakhirCekBlynk >= CEK_BLYNK_MS) {
+      terakhirCekBlynk = now;
+      Blynk.connect(1000);              // maksimal 1 detik
+    }
+  } else if (now - terakhirCekWiFi >= CEK_WIFI_MS) {
+    terakhirCekWiFi = now;
+    WiFi.reconnect();
+  }
+
+  // ===== 1. BACA SENSOR =====
+  int gas = bacaGas();
+  int apiPin = digitalRead(FLAME_PIN);
+  bool apiMentah = (apiPin == FLAME_AKTIF);
+
+  // Warm-up + kalibrasi gas (api tetap aktif selama ini)
+  if (!siap) {
+    if (now >= WARMUP_MS && now < WARMUP_MS + CALIB_MS) { calSum += gas; calN++; }
+    else if (now >= WARMUP_MS + CALIB_MS) {
+      baseline = calN ? (int)(calSum / calN) : gas;
+      siap = true;
+      Serial.printf("=== SIAGA | Baseline Gas = %d ===\n", baseline);
+    }
+  }
+  int selisih = siap ? gas - baseline : 0;
+
+  // Histeresis gas (hanya setelah siap)
+  if (!gasMentah && siap && selisih >= GAS_ON_DELTA) gasMentah = true;
+  else if (gasMentah && (!siap || selisih < GAS_OFF_DELTA)) gasMentah = false;
+
+  // ===== 2. VERIFIKASI GAS =====
+  if (gasMentah) {
+    gasHilang = 0;
+    if (gasMulai == 0) gasMulai = now;
+    if (!gasBahaya && now - gasMulai >= DELAY_GAS) {
+      gasBahaya = true;
+      Serial.println("[ALERT] GAS BAHAYA TERKONFIRMASI!");
+    }
+  } else {
+    gasMulai = 0;
+    if (gasBahaya) {
+      if (gasHilang == 0) gasHilang = now;
+      else if (now - gasHilang >= DELAY_GAS_AMAN) {
+        gasBahaya = false;
+        gasHilang = 0;
+        notifGasTerakhir = 0;
+        Serial.println("[INFO] Gas kembali aman.");
+      }
+    }
+  }
+
+  // ===== 3. VERIFIKASI API + PENDINGINAN POMPA =====
+  if (apiMentah) {
+  apiHilang = 0;
+  apiAbsenSejak = 0;                        // [TAMBAH]
+  if (apiMulai == 0) apiMulai = now;
+  if (!apiBahaya && now - apiMulai >= DELAY_API) {
+    apiBahaya = true;
+    Serial.println("[ALERT] API TERKONFIRMASI! Pompa ON.");
+  }
+} else {
+  apiMulai = 0;
+  if (apiBahaya) {
+    if (apiAbsenSejak == 0) apiAbsenSejak = now;   // [TAMBAH]
+    if (now - apiAbsenSejak >= API_ABSEN_MIN) {    // [TAMBAH] kedipan pendek diabaikan
+      if (apiHilang == 0) {
+        apiHilang = now;
+        Serial.println("[INFO] Api padam, pompa lanjut 5 detik (pendinginan).");
+      } else if (now - apiHilang >= DURASI_PENDINGINAN_POMPA) {
+        apiBahaya = false;
+        apiHilang = 0;
+        apiAbsenSejak = 0;
+        notifApiTerakhir = 0;
+        Serial.println("[INFO] Pendinginan selesai, pompa OFF.");
+      }
+    }
+  }
+}
+
+  if (apiBahaya && !apiBahayaSebelumnya) waktuBipApiMulai = now;
+  apiBahayaSebelumnya = apiBahaya;
+
+  // ===== 4. GERAKKAN KOMPONEN (tidak tergantung Blynk) =====
+  bool buzzerOn = false;
+  if (apiBahaya && (now - waktuBipApiMulai < DURASI_BIP_API)) {
+    buzzerOn = ((now - waktuBipApiMulai) / 200) % 2 == 0;   // bip putus-putus
+  } else if (gasBahaya) {
+    buzzerOn = true;                                         // gas: bunyi terus
+  }
+
+  if (apiBahaya) relayOn(); else relayOff();
+  digitalWrite(BUZZER_PIN, buzzerOn ? BUZZ_ON : BUZZ_OFF);
+
+  // ===== 5. NOTIFIKASI (paling akhir, hanya saat online) =====
+  if (Blynk.connected()) {
+    if (gasBahaya && (notifGasTerakhir == 0 || now - notifGasTerakhir >= JEDA_NOTIF)) {
+      Blynk.logEvent("gas_alert", "⚠️ Asap Terdeteksi!");
+      notifGasTerakhir = now;
+      Serial.println("[BLYNK] Notifikasi GAS terkirim.");
+    }
+    if (apiBahaya && (notifApiTerakhir == 0 || now - notifApiTerakhir >= JEDA_NOTIF)) {
+      Blynk.logEvent("fire_alert", "🔥 Api Terdeteksi! Pompa Aktif.");
+      notifApiTerakhir = now;
+      Serial.println("[BLYNK] Notifikasi API terkirim.");
+    }
+  }
+
+  // ===== 6. SERIAL =====
+  if (now - terakhirCetak >= 500) {
+    terakhirCetak = now;
+    Serial.printf("Gas AO=%d (base %d, +%d) %s | Api=%d %s | Relay:%s | Buzz:%s | Blynk:%s\n",
+                  gas, baseline, selisih,
+                  !siap ? "warmup" : (gasBahaya ? "BAHAYA" : (gasMentah ? "verif..." : "aman")),
+                  apiPin,
+                  apiBahaya ? "BAHAYA" : (apiMentah ? "verif..." : "aman"),
+                  apiBahaya ? "ON" : "OFF",
+                  buzzerOn ? "ON" : "OFF",
+                  Blynk.connected() ? "OK" : "OFFLINE");
+  }
+}
